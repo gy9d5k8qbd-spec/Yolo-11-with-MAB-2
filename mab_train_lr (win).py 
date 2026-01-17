@@ -1,0 +1,824 @@
+"""
+基于多臂老虎机 (Multi‑Armed Bandit, MAB) 的 YOLO11 学习率自动搜索脚本
+
+方案 A：仅针对学习率相关超参数做 ε-greedy 探索，完全复用 ultralytics 的 YOLO.train 接口，
+不修改现有工程代码。每一轮：
+ 1. 选择一个“臂”（一组 lr0 / lrf / cos_lr 组合）
+ 2. 用该组合训练若干个 epoch
+ 3. 从生成的 results.csv 中读取最后一轮的 mAP50-95 作为奖励
+ 4. 使用 ε-greedy 更新各臂的平均奖励 Q 值
+实验结束后输出最优学习率组合，并可选画出累计 regret 曲线。
+
+使用方式（在项目根目录下）：
+
+    python mab_train_lr.py --data mymodel.yaml --model yolo11n.pt \\
+                           --epochs 5 --rounds 10 --epsilon 0.2
+
+说明：
+- 默认数据集配置为 mymodel.yaml（与现有 train.py 一致）
+- 默认模型权重为 yolo11n.pt
+- 结果保存到 runs/mab_lr/ 目录下
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
+from ultralytics import YOLO
+
+try:
+    import matplotlib.pyplot as plt
+
+    MATPLOTLIB_AVAILABLE = True
+except Exception:  # pragma: no cover - 环境可能缺少 matplotlib
+    MATPLOTLIB_AVAILABLE = False
+    print("[警告] matplotlib 未安装，无法生成累计后悔曲线图像。")
+
+
+@dataclass
+class LRArm:
+    """表示一组候选学习率策略（一个“臂”）"""
+
+    name: str
+    lr0: float
+    lrf: float
+    cos_lr: bool
+
+
+def get_default_arms() -> List[LRArm]:
+    """
+    定义若干典型的学习率策略。
+
+    说明：
+      - lr0: 初始学习率
+      - lrf: 最终学习率与初始学习率的比例（配合调度器使用）
+      - cos_lr: 是否启用余弦退火调度（True 表示使用 cosine 调度）
+    """
+    return [
+        LRArm("A_cos_1e-2_to_1e-4", lr0=1e-2, lrf=1e-2, cos_lr=True),
+        LRArm("B_cos_5e-3_to_5e-5", lr0=5e-3, lrf=1e-2, cos_lr=True),
+        LRArm("C_lin_1e-2_to_1e-3", lr0=1e-2, lrf=1e-1, cos_lr=False),
+        LRArm("D_lin_3e-3_to_3e-5", lr0=3e-3, lrf=1e-2, cos_lr=False),
+    ]
+
+
+def read_last_map_from_results(results_csv: Path) -> Optional[float]:
+    """
+    从 YOLO 输出的 results.csv 中读取最后一行的 mAP 指标，优先使用 metrics/mAP50-95(B)，
+    若不存在则回退到 metrics/mAP50(B)。
+    """
+    if not results_csv.is_file():
+        print(f"[MAB] 未找到结果文件: {results_csv}")
+        return None
+
+    last_row: Optional[Dict[str, str]] = None
+    with results_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            last_row = row
+
+    if not last_row:
+        print(f"[MAB] 结果文件为空: {results_csv}")
+        return None
+
+    # 优先使用 mAP50-95，如果没有则退回 mAP50
+    for key in ("metrics/mAP50-95(B)", "metrics/mAP50(B)"):
+        if key in last_row and last_row[key] != "":
+            try:
+                return float(last_row[key])
+            except ValueError:
+                continue
+
+    print(f"[MAB] 未在 {results_csv} 中找到有效的 mAP 列")
+    return None
+
+
+def run_single_trial(
+    model_path: str,
+    data_path: str,
+    arm: LRArm,
+    round_idx: int,
+    epochs: int,
+    project: str,
+    algo_tag: str,
+    base_args: Optional[Dict] = None,
+) -> Optional[float]:
+    """
+    使用某个学习率臂运行一次短暂训练，并返回该轮的 reward（最终 mAP）。
+
+    为了最大限度复用现有训练脚本，仅通过 YOLO 官方接口传入超参数，不修改任何内部实现。
+    """
+    import torch
+    import gc
+
+    # IMPORTANT: algo_tag 用来区分不同算法的输出目录，避免并行运行时 서로覆盖同名 runs
+    # 例如：etc_D_lin_3e-3_to_3e-5_r97 / ucb_D_lin_... / ts_D_lin_...
+    run_name = f"{algo_tag}_{arm.name}_r{round_idx}"
+    print(f"\n[MAB-{algo_tag.upper()}] 第 {round_idx + 1} 轮，使用臂：{arm}")
+
+    # 在每次试验前清理 GPU 缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # 初始化模型（默认从预训练的 yolo11n.pt 开始）
+    model = YOLO(model_path)
+
+    train_kwargs: Dict = dict(
+        data=data_path,
+        epochs=epochs,
+        lr0=arm.lr0,
+        lrf=arm.lrf,
+        cos_lr=arm.cos_lr,
+        project=project,
+        name=run_name,
+        exist_ok=True,  # 允许覆盖/复用目录
+    )
+
+    # 复用现有 train.py 中的一些常用参数（如果需要可以在这里手动补充）
+    if base_args:
+        # 不覆盖我们在 arm 中明确指定的键
+        for k, v in base_args.items():
+            train_kwargs.setdefault(k, v)
+
+    try:
+        # 运行短训练
+        model.train(**train_kwargs)
+
+        # 读取该轮的结果
+        results_csv = Path(project) / run_name / "results.csv"
+        reward = read_last_map_from_results(results_csv)
+        if reward is None:
+            print(f"[MAB-{algo_tag.upper()}] 第 {round_idx + 1} 轮未能获得有效的 mAP，记为 0")
+            reward = 0.0
+        else:
+            print(f"[MAB-{algo_tag.upper()}] 第 {round_idx + 1} 轮 reward (mAP) = {reward:.4f}")
+    finally:
+        # 清理模型和 GPU 缓存
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    return reward
+
+
+def etc_bandit(
+    model_path: str,
+    data_path: str,
+    arms: List[LRArm],
+    rounds: int = 10,
+    epochs: int = 5,
+    project: str = "runs/mab_lr",
+    base_args: Optional[Dict] = None,
+    history_suffix: str = "_etc",
+    plot_suffix: str = "_etc",
+) -> Dict:
+    """
+    Explore-Then-Commit (ETC):
+    - 前 n_arms 轮：每个臂各探索一次
+    - 之后：始终使用当前平均奖励最高的臂
+    """
+
+    os.makedirs(project, exist_ok=True)
+
+    n_arms = len(arms)
+    counts = [0] * n_arms
+    qs = [0.0] * n_arms
+    history = []
+
+    cumulative_regret = 0.0
+
+    for t in range(rounds):
+        if t < n_arms:
+            arm_idx = t  # 逐个探索
+            policy = "explore"
+        else:
+            arm_idx = int(max(range(n_arms), key=lambda i: qs[i]))
+            policy = "exploit"
+
+        arm = arms[arm_idx]
+        print(f"\n[MAB-ETC] ==== Round {t + 1}/{rounds} | 选择臂 {arm.name} | 策略: {policy} ====")
+
+        reward = run_single_trial(
+            model_path=model_path,
+            data_path=data_path,
+            arm=arm,
+            round_idx=t,
+            epochs=epochs,
+            project=project,
+            algo_tag="etc",
+            base_args=base_args,
+        )
+
+        counts[arm_idx] += 1
+        n = counts[arm_idx]
+        qs[arm_idx] += (reward - qs[arm_idx]) / n
+
+        # 计算伪遗憾（pseudo-regret）：使用当前估计的最优臂的平均奖励
+        # 注意：这是伪遗憾，因为我们不知道真实的最优臂奖励
+        best_estimated_reward = max(qs) if qs else 0.0
+        instant_regret = max(0.0, best_estimated_reward - reward)
+        cumulative_regret += instant_regret
+
+        history.append(
+            {
+                "round": t + 1,
+                "arm_index": arm_idx,
+                "arm_name": arm.name,
+                "reward": reward,
+                "avg_reward": qs[arm_idx],
+                "best_estimated_reward": best_estimated_reward,
+                "instant_regret": instant_regret,
+                "cumulative_regret": cumulative_regret,
+                "policy": policy,
+            }
+        )
+
+    best_idx = int(max(range(n_arms), key=lambda i: qs[i]))
+    best_arm = arms[best_idx]
+
+    print("\n[MAB-ETC] ==== 实验完成，总结结果 ====")
+    for i, arm in enumerate(arms):
+        print(f"臂 {arm.name}: 选择次数={counts[i]}, 平均reward(mAP)={qs[i]:.4f}")
+    print(f"\n[MAB-ETC] 最佳学习率臂: {best_arm.name} -> lr0={best_arm.lr0}, lrf={best_arm.lrf}, cos_lr={best_arm.cos_lr}")
+
+    log_path = Path(project) / f"mab_lr_history{history_suffix}.csv"
+    if history:
+        fieldnames = list(history[0].keys())
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"[MAB-ETC] 试验日志已保存到: {log_path}")
+
+    if MATPLOTLIB_AVAILABLE:
+        rounds_x = [h["round"] for h in history]
+        cum_regrets = [h["cumulative_regret"] for h in history]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(rounds_x, cum_regrets, label="ETC", color="tab:blue")
+        plt.xlabel("Round (t)")
+        plt.ylabel("Cumulative Regret")
+        plt.title(f"LR Bandit (ETC, rounds={rounds}, epochs={epochs})")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+
+        img_path = Path(project) / f"lr_bandit_cumulative_regret{plot_suffix}.png"
+        plt.tight_layout()
+        plt.savefig(img_path, dpi=200)
+        plt.close()
+        print(f"[MAB-ETC] 累计后悔曲线已保存到: {img_path}")
+
+    else:
+        print("[MAB-ETC] 未安装 matplotlib，跳过绘图步骤。")
+
+    return {
+        "arms": arms,
+        "counts": counts,
+        "avg_rewards": qs,
+        "history": history,
+        "best_arm": best_arm,
+    }
+
+
+def ucb_bandit(
+    model_path: str,
+    data_path: str,
+    arms: List[LRArm],
+    rounds: int = 10,
+    epochs: int = 5,
+    project: str = "runs/mab_lr",
+    base_args: Optional[Dict] = None,
+    history_suffix: str = "_ucb",
+    plot_suffix: str = "_ucb",
+    c: float = 2.0,
+) -> Dict:
+    """
+    使用 UCB1 策略在给定的学习率臂之间进行选择。
+    """
+
+    os.makedirs(project, exist_ok=True)
+
+    n_arms = len(arms)
+    counts = [0] * n_arms
+    qs = [0.0] * n_arms
+    history = []
+
+    cumulative_regret = 0.0
+
+    for t in range(rounds):
+        # 先确保每个臂至少被尝试一次
+        if t < n_arms:
+            arm_idx = t
+            policy = "init"
+        else:
+            # 标准 UCB1 公式：使用当前轮数 t+1（因为 t 从 0 开始）
+            ucb_values = []
+            for i in range(n_arms):
+                if counts[i] == 0:
+                    ucb = float("inf")
+                else:
+                    # UCB1 公式：Q(a) + c * sqrt(2 * ln(t) / N(a))
+                    bonus = c * math.sqrt(2 * math.log(t + 1) / counts[i])
+                    ucb = qs[i] + bonus
+                ucb_values.append(ucb)
+            arm_idx = int(max(range(n_arms), key=lambda i: ucb_values[i]))
+            policy = "ucb"
+
+        arm = arms[arm_idx]
+        print(f"\n[MAB-UCB] ==== Round {t + 1}/{rounds} | 选择臂 {arm.name} | 策略: {policy} ====")
+
+        reward = run_single_trial(
+            model_path=model_path,
+            data_path=data_path,
+            arm=arm,
+            round_idx=t,
+            epochs=epochs,
+            project=project,
+            algo_tag="ucb",
+            base_args=base_args,
+        )
+
+        counts[arm_idx] += 1
+        n = counts[arm_idx]
+        qs[arm_idx] += (reward - qs[arm_idx]) / n
+
+        # 计算伪遗憾（pseudo-regret）：使用当前估计的最优臂的平均奖励
+        # 注意：这是伪遗憾，因为我们不知道真实的最优臂奖励
+        best_estimated_reward = max(qs) if qs else 0.0
+        instant_regret = max(0.0, best_estimated_reward - reward)
+        cumulative_regret += instant_regret
+
+        history.append(
+            {
+                "round": t + 1,
+                "arm_index": arm_idx,
+                "arm_name": arm.name,
+                "reward": reward,
+                "avg_reward": qs[arm_idx],
+                "best_estimated_reward": best_estimated_reward,
+                "instant_regret": instant_regret,
+                "cumulative_regret": cumulative_regret,
+                "policy": policy,
+            }
+        )
+
+    best_idx = int(max(range(n_arms), key=lambda i: qs[i]))
+    best_arm = arms[best_idx]
+
+    print("\n[MAB-UCB] ==== 实验完成，总结结果 ====")
+    for i, arm in enumerate(arms):
+        print(f"臂 {arm.name}: 选择次数={counts[i]}, 平均reward(mAP)={qs[i]:.4f}")
+    print(f"\n[MAB-UCB] 最佳学习率臂: {best_arm.name} -> lr0={best_arm.lr0}, lrf={best_arm.lrf}, cos_lr={best_arm.cos_lr}")
+
+    log_path = Path(project) / f"mab_lr_history{history_suffix}.csv"
+    if history:
+        fieldnames = list(history[0].keys())
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"[MAB-UCB] 试验日志已保存到: {log_path}")
+
+    if MATPLOTLIB_AVAILABLE:
+        rounds_x = [h["round"] for h in history]
+        cum_regrets = [h["cumulative_regret"] for h in history]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(rounds_x, cum_regrets, label="UCB", color="tab:orange")
+        plt.xlabel("Round (t)")
+        plt.ylabel("Cumulative Regret")
+        plt.title(f"LR Bandit (UCB, rounds={rounds}, epochs={epochs})")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+
+        img_path = Path(project) / f"lr_bandit_cumulative_regret{plot_suffix}.png"
+        plt.tight_layout()
+        plt.savefig(img_path, dpi=200)
+        plt.close()
+        print(f"[MAB-UCB] 累计后悔曲线已保存到: {img_path}")
+    else:
+        print("[MAB-UCB] 未安装 matplotlib，跳过绘图步骤。")
+
+    return {
+        "arms": arms,
+        "counts": counts,
+        "avg_rewards": qs,
+        "history": history,
+        "best_arm": best_arm,
+    }
+
+
+def thompson_bandit(
+    model_path: str,
+    data_path: str,
+    arms: List[LRArm],
+    rounds: int = 10,
+    epochs: int = 5,
+    project: str = "runs/mab_lr",
+    base_args: Optional[Dict] = None,
+    history_suffix: str = "_ts",
+    plot_suffix: str = "_ts",
+) -> Dict:
+    """
+    使用简单的 Beta 分布形式的 Thompson Sampling 策略。
+    将 mAP ∈ [0,1] 视为“成功率”，对每个臂维护 Beta(alpha, beta)。
+    """
+
+    os.makedirs(project, exist_ok=True)
+
+    n_arms = len(arms)
+    counts = [0] * n_arms
+    qs = [0.0] * n_arms
+    history = []
+
+    # 初始 Beta 分布参数
+    alphas = [1.0] * n_arms
+    betas = [1.0] * n_arms
+
+    cumulative_regret = 0.0
+
+    for t in range(rounds):
+        # 从每个臂的 Beta 分布采样
+        samples = [random.betavariate(alphas[i], betas[i]) for i in range(n_arms)]
+        arm_idx = int(max(range(n_arms), key=lambda i: samples[i]))
+        policy = "thompson"
+
+        arm = arms[arm_idx]
+        print(f"\n[MAB-TS] ==== Round {t + 1}/{rounds} | 选择臂 {arm.name} | 策略: {policy} ====")
+
+        reward = run_single_trial(
+            model_path=model_path,
+            data_path=data_path,
+            arm=arm,
+            round_idx=t,
+            epochs=epochs,
+            project=project,
+            algo_tag="ts",
+            base_args=base_args,
+        )
+
+        counts[arm_idx] += 1
+        n = counts[arm_idx]
+        qs[arm_idx] += (reward - qs[arm_idx]) / n
+
+        # 更新 Beta 分布参数
+        # 注意：标准 Thompson Sampling 用于二值奖励（Bernoulli），但 mAP 是连续值 [0,1]
+        # 这里将 mAP 视为"成功率"的近似，使用 Beta 分布更新：
+        # - alpha += reward（成功次数）
+        # - beta += (1 - reward)（失败次数）
+        # 这是 Beta-Bernoulli 的连续值近似，虽然不是最优，但对于 [0,1] 范围的奖励是合理的
+        r_clamped = max(0.0, min(1.0, reward))
+        alphas[arm_idx] += r_clamped
+        betas[arm_idx] += 1.0 - r_clamped
+
+        # 计算伪遗憾（pseudo-regret）：使用当前估计的最优臂的平均奖励
+        # 与 ETC 和 UCB 保持一致，确保对比公平
+        best_estimated_reward = max(qs) if qs else 0.0
+        instant_regret = max(0.0, best_estimated_reward - reward)
+        cumulative_regret += instant_regret
+
+        history.append(
+            {
+                "round": t + 1,
+                "arm_index": arm_idx,
+                "arm_name": arm.name,
+                "reward": reward,
+                "avg_reward": qs[arm_idx],
+                "best_estimated_reward": best_estimated_reward,
+                "instant_regret": instant_regret,
+                "cumulative_regret": cumulative_regret,
+                "policy": policy,
+            }
+        )
+
+    best_idx = int(max(range(n_arms), key=lambda i: qs[i]))
+    best_arm = arms[best_idx]
+
+    print("\n[MAB-TS] ==== 实验完成，总结结果 ====")
+    for i, arm in enumerate(arms):
+        print(f"臂 {arm.name}: 选择次数={counts[i]}, 平均reward(mAP)={qs[i]:.4f}")
+    print(f"\n[MAB-TS] 最佳学习率臂: {best_arm.name} -> lr0={best_arm.lr0}, lrf={best_arm.lrf}, cos_lr={best_arm.cos_lr}")
+
+    log_path = Path(project) / f"mab_lr_history{history_suffix}.csv"
+    if history:
+        fieldnames = list(history[0].keys())
+        with log_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"[MAB-TS] 试验日志已保存到: {log_path}")
+
+    if MATPLOTLIB_AVAILABLE:
+        rounds_x = [h["round"] for h in history]
+        cum_regrets = [h["cumulative_regret"] for h in history]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(rounds_x, cum_regrets, label="Thompson", color="tab:green")
+        plt.xlabel("Round (t)")
+        plt.ylabel("Cumulative Regret")
+        plt.title(f"LR Bandit (Thompson, rounds={rounds}, epochs={epochs})")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+
+        img_path = Path(project) / f"lr_bandit_cumulative_regret{plot_suffix}.png"
+        plt.tight_layout()
+        plt.savefig(img_path, dpi=200)
+        plt.close()
+        print(f"[MAB-TS] 累计后悔曲线已保存到: {img_path}")
+    else:
+        print("[MAB-TS] 未安装 matplotlib，跳过绘图步骤。")
+
+    return {
+        "arms": arms,
+        "counts": counts,
+        "avg_rewards": qs,
+        "history": history,
+        "best_arm": best_arm,
+    }
+
+
+def load_history_and_plot_comparison(project: str = "runs/mab_lr") -> None:
+    """
+    从已有的 CSV 文件中读取三种算法的历史记录，生成对比图。
+    
+    Args:
+        project: 项目目录路径
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        print("[MAB] 未安装 matplotlib，无法生成对比图")
+        return
+    
+    project_path = Path(project)
+    csv_files = {
+        "ETC": project_path / "mab_lr_history_etc.csv",
+        "UCB": project_path / "mab_lr_history_ucb.csv",
+        "Thompson": project_path / "mab_lr_history_ts.csv",
+    }
+    
+    plt.figure(figsize=(10, 5))
+    colors = {"ETC": "tab:blue", "UCB": "tab:orange", "Thompson": "tab:green"}
+    
+    found_any = False
+    for label, csv_path in csv_files.items():
+        if not csv_path.exists():
+            print(f"[MAB] 警告: 未找到 {label} 的历史文件: {csv_path}")
+            continue
+        
+        try:
+            history = []
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    history.append({
+                        "round": int(row["round"]),
+                        "cumulative_regret": float(row["cumulative_regret"]),
+                    })
+            
+            if not history:
+                print(f"[MAB] 警告: {label} 的历史文件为空")
+                continue
+            
+            found_any = True
+            x = [h["round"] for h in history]
+            y = [h["cumulative_regret"] for h in history]
+            plt.plot(x, y, label=label, linewidth=1.5, alpha=0.9, color=colors[label])
+            print(f"[MAB] 已加载 {label}: {len(history)} 轮数据")
+        except Exception as e:
+            print(f"[MAB] 读取 {label} 历史文件失败: {e}")
+            continue
+    
+    if not found_any:
+        print("[MAB] 错误: 未找到任何可用的历史文件，无法生成对比图")
+        print(f"[MAB] 请确保以下文件至少存在一个:")
+        for label, csv_path in csv_files.items():
+            print(f"  - {csv_path}")
+        return
+    
+    plt.xlabel("Round (t)")
+    plt.ylabel("Cumulative Regret")
+    plt.title("Algorithm Comparison (from existing CSV files)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    
+    img_all = project_path / "lr_bandit_cumulative_regret_all.png"
+    plt.tight_layout()
+    plt.savefig(img_all, dpi=200)
+    plt.close()
+    print(f"[MAB] 三种算法对比曲线已保存到: {img_all}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="YOLO11 LR Bandit Tuning (ETC / UCB / TS)")
+    parser.add_argument("--model", type=str, default="yolo11n.pt", help="模型权重路径或模型名称")
+    parser.add_argument("--data", type=str, default="mymodel4.yaml", help="数据集配置 YAML 路径")
+    parser.add_argument("--epochs", type=int, default=3, help="每个臂试验的 epoch 数")
+    parser.add_argument("--rounds", type=int, default=100, help="Bandit 试验轮数")
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default="all",
+        choices=["all", "etc", "ucb", "ts", "compare"],
+        help="选择运行的算法：all / etc / ucb / ts / compare（compare 模式仅读取已有 CSV 生成对比图）",
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default="runs/mab_lr",
+        help="YOLO 训练输出的项目目录（会在其中保存历史与图像）",
+    )
+    parser.add_argument(
+        "--note",
+        type=str,
+        default="",
+        help="可选备注信息（不影响训练，仅用于区分实验）",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="训练设备：'cpu' / '0' (GPU 0) / 'cuda' / None (自动检测，优先 GPU)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    # 让 CPU 训练尊重传入的 workers（Ultralytics 默认会在 CPU/MPS 上强制 workers=0）
+    # - "1"（默认）：强制 workers=0
+    # - "0"：不强制，使用你传入的值（例如 base_args 里设置的 8）
+    os.environ["ULTRALYTICS_FORCE_WORKERS0_CPU"] = "0"
+    args = parse_args()
+
+    # compare 模式：只读取已有 CSV 生成对比图，不训练
+    if args.algo == "compare":
+        print("====== MAB 算法对比图生成模式 ======")
+        print(f"从项目目录读取已有历史文件: {args.project}")
+        load_history_and_plot_comparison(args.project)
+        return
+
+    print("====== YOLO11 学习率多臂老虎机调参 (方案 A) ======")
+    print(f"模型: {args.model}")
+    print(f"数据集配置: {args.data}")
+    print(f"每个臂试验 epoch: {args.epochs}, 总轮数={args.rounds}, 算法={args.algo}")
+
+    arms = get_default_arms()
+    print("\n可选学习率臂：")
+    for a in arms:
+        print(f"  - {a.name}: lr0={a.lr0}, lrf={a.lrf}, cos_lr={a.cos_lr}")
+
+    # 自动检测或使用用户指定的设备
+    if args.device is None:
+        # 自动检测：优先使用 GPU（如果可用），否则使用 CPU
+        if torch.cuda.is_available():
+            device = "0"  # 使用第一个 GPU
+            print(f"[MAB] 检测到 GPU: {torch.cuda.get_device_name(0)}，将使用 GPU 训练")
+        else:
+            device = "cpu"
+            print("[MAB] 未检测到 GPU，将使用 CPU 训练（速度较慢）")
+    else:
+        device = args.device
+        if device == "0" or device.startswith("cuda"):
+            if torch.cuda.is_available():
+                print(f"[MAB] 使用用户指定的设备: {device} (GPU: {torch.cuda.get_device_name(0)})")
+            else:
+                print(f"[MAB] 警告：用户指定了 {device}，但未检测到 GPU，将回退到 CPU")
+                device = "cpu"
+        else:
+            print(f"[MAB] 使用用户指定的设备: {device}")
+
+    # 这里可以从现有 train.py 复用一些通用超参，例如 workers、imgsz 等
+    # 优化建议：
+    # 1. cache="disk": 使用磁盘缓存，比 False 快很多，且不占用太多内存，结果可复现
+    # 2. batch=8: 对于 6GB GPU，batch=8 更安全，避免内存溢出
+    # 3. workers=2: Windows 上减少 workers 避免共享内存问题，且降低内存占用
+    # 4. pin_memory=False: Windows 上有时 pin_memory 会导致共享内存错误
+    base_args = {
+        "device": device,
+        "workers": 2,         # Windows 上减少 workers，避免共享内存问题和内存累积
+        "optimizer": "SGD",   # 关闭 optimizer=auto，确保 lr0/lrf 生效
+        "cache": "disk",      # 使用磁盘缓存（比 False 快很多，且不占用太多内存，结果可复现）
+        "plots": False,       # 关闭 YOLO 自带训练图，避免额外开销
+        "imgsz": 512,         # 将输入尺寸从 640 降到 512，减少 GFLOPs、提升速度
+        "batch": 8,           # 对于 6GB GPU，batch=8 更安全，避免 CUDA OOM
+    }
+
+    results_eps = results_ucb = results_ts = None
+
+    # 根据命令行选择要运行的算法
+    if args.algo in ("all", "etc"):
+        results_eps = etc_bandit(
+            model_path=args.model,
+            data_path=args.data,
+            arms=arms,
+            rounds=args.rounds,
+            epochs=args.epochs,
+            project=args.project,
+            base_args=base_args,
+            history_suffix="_etc",
+            plot_suffix="_etc",
+        )
+
+    if args.algo in ("all", "ucb"):
+        results_ucb = ucb_bandit(
+            model_path=args.model,
+            data_path=args.data,
+            arms=arms,
+            rounds=args.rounds,
+            epochs=args.epochs,
+            project=args.project,
+            base_args=base_args,
+            history_suffix="_ucb",
+            plot_suffix="_ucb",
+        )
+
+    if args.algo in ("all", "ts"):
+        results_ts = thompson_bandit(
+            model_path=args.model,
+            data_path=args.data,
+            arms=arms,
+            rounds=args.rounds,
+            epochs=args.epochs,
+            project=args.project,
+            base_args=base_args,
+            history_suffix="_ts",
+            plot_suffix="_ts",
+        )
+
+    # 根据选择的算法决定最终推荐
+    if args.algo == "etc":
+        best_algo = "ETC"
+        best_res = results_eps
+    elif args.algo == "ucb":
+        best_algo = "UCB"
+        best_res = results_ucb
+    elif args.algo == "ts":
+        best_algo = "Thompson"
+        best_res = results_ts
+    else:  # all
+        all_results = [
+            ("ETC", results_eps),
+            ("UCB", results_ucb),
+            ("Thompson", results_ts),
+        ]
+        # 过滤掉可能为 None 的结果（防御编程）
+        all_results = [r for r in all_results if r[1] is not None]
+        best_algo, best_res = max(
+            all_results,
+            key=lambda x: max(x[1]["avg_rewards"]) if x[1]["avg_rewards"] else -1,
+        )
+
+    best: LRArm = best_res["best_arm"]
+
+    print("\n====== 综合建议的最终学习率配置 ======")
+    print(f"最佳算法: {best_algo}")
+    print(f"最佳臂 {best.name}:")
+    print(f"  lr0 = {best.lr0}")
+    print(f"  lrf = {best.lrf}")
+    print(f"  cos_lr = {best.cos_lr}")
+    print("\n你可以在正式训练脚本中这样使用：")
+    print(
+        f"model = YOLO('{args.model}')\n"
+        f"model.train(data='{args.data}', epochs=50, lr0={best.lr0}, "
+        f"lrf={best.lrf}, cos_lr={str(best.cos_lr)}, "
+        f"workers={base_args['workers']}, optimizer='{base_args['optimizer']}')"
+    )
+
+    # 仅在 algo=all 时生成三种算法对比的累计 regret 曲线
+    if MATPLOTLIB_AVAILABLE and args.algo == "all":
+        plt.figure(figsize=(10, 5))
+        for label, res, color in [
+            ("ETC", results_eps, "tab:blue"),
+            ("UCB", results_ucb, "tab:orange"),
+            ("Thompson", results_ts, "tab:green"),
+        ]:
+            hist = res["history"]
+            if not hist:
+                continue
+            x = [h["round"] for h in hist]
+            y = [h["cumulative_regret"] for h in hist]
+            plt.plot(x, y, label=label, linewidth=1.5, alpha=0.9, color=color)
+
+        plt.xlabel("Round (t)")
+        plt.ylabel("Cumulative Regret")
+        plt.title(f"Algorithm Comparison (n={args.rounds})")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        img_all = Path(args.project) / "lr_bandit_cumulative_regret_all.png"
+        plt.tight_layout()
+        plt.savefig(img_all, dpi=200)
+        plt.close()
+        print(f"[MAB] 三种算法对比曲线已保存到: {img_all}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
+
